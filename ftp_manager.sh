@@ -228,14 +228,33 @@ def start_server():
     
     # 设置带宽限制（可选）
     dtp_handler = ThrottledDTPHandler
-    dtp_handler.read_limit = config.getint('server', 'download_limit', fallback=102400)  # 100 KB/s
-    dtp_handler.write_limit = config.getint('server', 'upload_limit', fallback=102400)   # 100 KB/s
+    
+    # 安全地获取下载限制
+    try:
+        dtp_handler.read_limit = config.getint('server', 'download_limit', fallback=102400)
+    except (ValueError, configparser.NoOptionError, configparser.NoSectionError) as e:
+        logger.warning(f"读取下载限制失败，使用默认值: {e}")
+        dtp_handler.read_limit = 102400
+    
+    # 安全地获取上传限制
+    try:
+        dtp_handler.write_limit = config.getint('server', 'upload_limit', fallback=102400)
+    except (ValueError, configparser.NoOptionError, configparser.NoSectionError) as e:
+        logger.warning(f"读取上传限制失败，使用默认值: {e}")
+        dtp_handler.write_limit = 102400
+    
     handler.dtp_handler = dtp_handler
     
     # 其他设置
     handler.banner = config.get('server', 'banner', fallback="Termux FTP Server - Secure File Transfer")
     handler.max_login_attempts = 3
-    handler.timeout = config.getint('server', 'timeout', fallback=300)
+    
+    # 安全地获取超时设置
+    try:
+        handler.timeout = config.getint('server', 'timeout', fallback=300)
+    except (ValueError, configparser.NoOptionError, configparser.NoSectionError) as e:
+        logger.warning(f"读取超时设置失败，使用默认值: {e}")
+        handler.timeout = 300
     
     # 创建服务器
     server = FTPServer((host, port), handler)
@@ -660,8 +679,8 @@ passive_ports_start = 60000
 passive_ports_end = 60100
 
 # 带宽限制（字节/秒）
-download_limit = 102400  # 100 KB/s
-upload_limit = 102400    # 100 KB/s
+download_limit = 102400
+upload_limit = 102400
 
 # 匿名访问
 allow_anonymous = no
@@ -685,12 +704,12 @@ log_enabled = yes
 log_file = $LOG_DIR/ftp_access.log
 log_level = INFO
 rotate_logs = yes
-max_log_size = 10485760  # 10 MB
+max_log_size = 10485760
 
 [backup]
 # 备份设置
 auto_backup = yes
-backup_interval = 86400  # 每天
+backup_interval = 86400
 keep_backups = 7
 EOF
     
@@ -859,6 +878,8 @@ EOF
 
 # 创建系统服务（可选）
 create_service_file() {
+    mkdir -p "$HOME/.termux/boot"
+    
     cat > "$HOME/.termux/boot/start_ftp" << EOF
 #!/data/data/com.termux/files/usr/bin/bash
 # 开机自动启动FTP服务器
