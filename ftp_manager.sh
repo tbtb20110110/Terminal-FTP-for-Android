@@ -75,7 +75,7 @@ install_dependencies() {
     
     # 安装必要软件
     pkg install -y python python-pip openssl nano wget curl sqlite \
-                   termux-api qrencode jq bc
+                   termux-api libqrencode jq bc
     
     # 安装Python FTP库
     pip install pyftpdlib cryptography bcrypt
