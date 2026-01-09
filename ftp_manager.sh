@@ -77,8 +77,8 @@ install_dependencies() {
     pkg install -y python python-pip openssl nano wget curl sqlite \
                    termux-api libqrencode jq bc
     
-    # 安装Python FTP库
-    pip install pyftpdlib cryptography bcrypt
+    # 安装Python FTP库 - 移除了不必要的cryptography库
+    pip install pyftpdlib
     
     # 安装vsftpd作为备选
     pkg install -y vsftpd proftpd 2>/dev/null || log "某些包安装失败" "WARNING"
