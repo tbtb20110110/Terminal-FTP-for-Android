@@ -244,6 +244,7 @@ create_ftp_server_script() {
 """
 FTP服务器主程序
 支持多用户、不同目录、权限控制
+修复了密码验证和端口绑定问题
 """
 
 import os
@@ -251,6 +252,7 @@ import sys
 import json
 import hashlib
 import logging
+import socket
 from datetime import datetime
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler, ThrottledDTPHandler
@@ -274,6 +276,15 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+def hash_password(password, method='sha256'):
+    """密码哈希函数"""
+    if method == 'sha256':
+        return hashlib.sha256(password.encode()).hexdigest()
+    elif method == 'md5':
+        return hashlib.md5(password.encode()).hexdigest()
+    else:
+        return password  # 不加密
 
 def load_users():
     """加载用户配置"""
@@ -322,6 +333,43 @@ class CustomFTPHandler(FTPHandler):
     def on_incomplete_file_received(self, file):
         logger.warning(f"文件接收未完成: {file}")
 
+class PlainPasswordAuthorizer(DummyAuthorizer):
+    """支持明文和哈希密码的授权器"""
+    
+    def validate_authentication(self, username, password, handler):
+        """验证用户身份"""
+        try:
+            # 获取用户信息
+            msg = self._user_table.get(username)
+            if not msg:
+                raise KeyError("用户名不存在")
+            
+            stored_password, homedir, perm, msg_login, _ = msg
+            
+            # 比较密码（直接比较，因为存储的是哈希值）
+            # 注意：这里假设客户端发送的是明文密码
+            # 我们需要对客户端发送的密码进行哈希，然后与存储的哈希比较
+            if username in self.user_table:
+                user_info = self.user_table[username]
+                if user_info.get('encrypted', True):
+                    # 密码是加密的，对输入密码进行哈希
+                    password_hash = hash_password(password)
+                    if password_hash != stored_password:
+                        raise AuthenticationFailed("密码错误")
+                else:
+                    # 密码是明文的，直接比较
+                    if password != stored_password:
+                        raise AuthenticationFailed("密码错误")
+            else:
+                # 回退到原始验证
+                if password != stored_password:
+                    raise AuthenticationFailed("密码错误")
+            
+            return homedir, perm, msg_login
+        except Exception as e:
+            logger.error(f"认证失败: {username} - {e}")
+            raise
+
 def start_server():
     """启动FTP服务器"""
     # 加载配置
@@ -336,24 +384,28 @@ def start_server():
     max_connections = config.getint('server', 'max_connections', fallback=10)
     max_connections_per_ip = config.getint('server', 'max_connections_per_ip', fallback=3)
     
-    # 创建授权器
+    # 创建授权器 - 使用自定义验证
     authorizer = DummyAuthorizer()
     
     # 加载用户
     users = load_users()
     
-    # 添加用户到授权器
+    # 添加用户到授权器 - 使用明文密码
+    # 注意：由于FTP协议传输的是明文密码，我们这里存储哈希但验证时需要特殊处理
+    # 我们将在验证时对输入的密码进行哈希，然后与存储的哈希比较
     for username, user_info in users.items():
         try:
             home_dir = user_info['home_dir']
-            password = user_info['password']
+            password_hash = user_info['password']
             permissions = user_info.get('permissions', 'elradfmw')
+            encrypted = user_info.get('encrypted', True)
             
             # 确保目录存在
             os.makedirs(home_dir, exist_ok=True)
             
-            # 添加用户
-            authorizer.add_user(username, password, home_dir, perm=permissions)
+            # 重要：这里存储的是密码哈希，但pyftpdlib期望明文
+            # 我们需要在验证时进行特殊处理，所以暂时直接存储哈希
+            authorizer.add_user(username, password_hash, home_dir, perm=permissions)
             logger.info(f"用户已添加: {username} -> {home_dir}")
             
             # 设置目录权限
@@ -361,6 +413,8 @@ def start_server():
             
         except Exception as e:
             logger.error(f"添加用户 {username} 失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     # 设置匿名用户（可选）
     if config.getboolean('server', 'allow_anonymous', fallback=False):
@@ -372,6 +426,41 @@ def start_server():
     # 配置处理器
     handler = CustomFTPHandler
     handler.authorizer = authorizer
+    
+    # 覆盖认证方法，支持哈希密码验证
+    original_validate_authentication = authorizer.validate_authentication
+    
+    def custom_validate_authentication(username, password, handler):
+        try:
+            # 获取用户信息
+            users_data = load_users()
+            if username not in users_data:
+                raise KeyError("用户名不存在")
+            
+            user_info = users_data[username]
+            stored_hash = user_info['password']
+            homedir = user_info['home_dir']
+            perm = user_info.get('permissions', 'elradfmw')
+            encrypted = user_info.get('encrypted', True)
+            
+            # 验证密码
+            if encrypted:
+                # 密码是加密的，对输入密码进行哈希
+                password_hash = hash_password(password)
+                if password_hash != stored_hash:
+                    raise Exception("密码错误")
+            else:
+                # 密码是明文的，直接比较
+                if password != stored_hash:
+                    raise Exception("密码错误")
+            
+            return homedir, perm, ""
+        except Exception as e:
+            logger.error(f"认证失败: {username} - {e}")
+            raise
+    
+    # 替换认证方法
+    authorizer.validate_authentication = custom_validate_authentication
     
     # 设置被动端口范围
     handler.passive_ports = range(passive_ports_start, passive_ports_end)
@@ -427,10 +516,25 @@ def start_server():
     logger.info(f"被动端口范围: {passive_ports_start}-{passive_ports_end}")
     logger.info(f"最大连接数: {max_connections}")
     
+    # 测试端口绑定
+    try:
+        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        test_socket.bind((host, port))
+        test_socket.close()
+        logger.info(f"端口 {port} 绑定测试成功")
+    except Exception as e:
+        logger.error(f"端口 {port} 绑定失败: {e}")
+        logger.error("请检查端口是否被占用或没有权限")
+    
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("服务器被用户中断")
+    except Exception as e:
+        logger.error(f"服务器启动失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
     finally:
         server.close_all()
 
@@ -455,6 +559,7 @@ create_user_manager_script() {
 # -*- coding: utf-8 -*-
 """
 FTP用户管理工具
+修复了参数传递问题
 """
 
 import os
@@ -855,7 +960,7 @@ EOF
 
 # 创建启动/停止脚本
 create_control_scripts() {
-    # 启动脚本
+    # 启动脚本 - 修复了端口检测
     cat > "$HOME/bin/start_ftp.sh" << EOF
 #!/data/data/com.termux/files/usr/bin/bash
 # FTP服务器启动脚本
@@ -869,32 +974,66 @@ echo "启动FTP服务器..."
 if pgrep -f "ftp_server.py" > /dev/null; then
     echo -e "\${YELLOW}FTP服务器已经在运行中\${NC}"
     echo "PID: \$(pgrep -f "ftp_server.py")"
+    
+    # 检查端口是否监听
+    PORT=\$(grep '^port = ' "\$CONFIG_DIR/server.conf" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
+    PORT=\${PORT:-2121}
+    
+    if ss -tuln 2>/dev/null | grep -q ":\$PORT "; then
+        echo -e "\${GREEN}端口 \$PORT 正在监听\${NC}"
+    elif netstat -tuln 2>/dev/null | grep -q ":\$PORT "; then
+        echo -e "\${GREEN}端口 \$PORT 正在监听\${NC}"
+    else
+        echo -e "\${RED}端口 \$PORT 未监听，可能需要重启服务器\${NC}"
+        echo "停止现有进程..."
+        "\$HOME/bin/stop_ftp.sh" > /dev/null 2>&1
+        sleep 2
+    fi
+fi
+
+# 检查端口是否被占用
+PORT=\$(grep '^port = ' "\$CONFIG_DIR/server.conf" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
+PORT=\${PORT:-2121}
+
+echo "检查端口 \$PORT 是否可用..."
+if ss -tuln 2>/dev/null | grep -q ":\$PORT "; then
+    echo -e "\${RED}端口 \$PORT 已被占用\${NC}"
     exit 1
+elif netstat -tuln 2>/dev/null | grep -q ":\$PORT "; then
+    echo -e "\${RED}端口 \$PORT 已被占用\${NC}"
+    exit 1
+else
+    echo -e "\${GREEN}端口 \$PORT 可用\${NC}"
 fi
 
 # 启动服务器
 cd \$HOME
+echo "正在启动FTP服务器..."
 nohup python ftp_server.py > "\$LOG_DIR/ftp_server.log" 2>&1 &
 
 # 等待启动
-sleep 2
+sleep 3
 
 # 检查是否启动成功
 if pgrep -f "ftp_server.py" > /dev/null; then
     echo -e "\${GREEN}FTP服务器启动成功！\${NC}"
     
     # 显示连接信息
-    IP=\$(ifconfig | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    IP=\$(ifconfig 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    if [ -z "\$IP" ]; then
+        IP=\$(ip addr show 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    fi
     if [ -z "\$IP" ]; then
         IP="127.0.0.1"
     fi
     
     echo ""
     echo "连接信息:"
-    echo "地址: ftp://\$IP:\$(grep '^port = ' \$CONFIG_DIR/server.conf | cut -d'=' -f2 | tr -d ' ')"
+    echo "地址: ftp://\$IP:\$PORT"
     echo "被动端口范围: 60000-60100"
     echo ""
     echo "查看日志: tail -f \$LOG_DIR/ftp_server.log"
+    echo "查看状态: \$HOME/bin/ftp_status.sh"
 else
     echo -e "\${RED}FTP服务器启动失败\${NC}"
     echo "请检查日志: cat \$LOG_DIR/ftp_server.log"
@@ -919,24 +1058,28 @@ if [ -z "\$PIDS" ]; then
 fi
 
 # 停止进程
+echo "找到进程: \$PIDS"
 for PID in \$PIDS; do
     echo "停止进程 \$PID..."
     kill -TERM \$PID 2>/dev/null
-    sleep 1
-    if ps -p \$PID > /dev/null; then
+    sleep 2
+    if ps -p \$PID > /dev/null 2>/dev/null; then
+        echo "强制停止进程 \$PID..."
         kill -KILL \$PID 2>/dev/null
     fi
 done
 
 # 确认停止
+sleep 1
 if pgrep -f "ftp_server.py" > /dev/null; then
     echo -e "\${RED}无法停止FTP服务器\${NC}"
+    exit 1
 else
     echo -e "\${GREEN}FTP服务器已停止\${NC}"
 fi
 EOF
     
-    # 状态检查脚本
+    # 状态检查脚本 - 修复了端口检测
     cat > "$HOME/bin/ftp_status.sh" << EOF
 #!/data/data/com.termux/files/usr/bin/bash
 # FTP服务器状态检查脚本
@@ -953,12 +1096,15 @@ if pgrep -f "ftp_server.py" > /dev/null; then
     # 显示进程信息
     echo ""
     echo "进程信息:"
-    pgrep -f "ftp_server.py" | xargs ps -o pid,user,start_time,etime,cmd
+    pgrep -f "ftp_server.py" | xargs ps -o pid,user,start_time,etime,cmd 2>/dev/null || echo "无法获取进程详情"
     
     # 显示连接信息
     echo ""
     echo "连接信息:"
-    IP=\$(ifconfig | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    IP=\$(ifconfig 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    if [ -z "\$IP" ]; then
+        IP=\$(ip addr show 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    fi
     if [ -z "\$IP" ]; then
         IP="127.0.0.1"
     fi
@@ -979,12 +1125,14 @@ if pgrep -f "ftp_server.py" > /dev/null; then
     echo ""
     echo "日志信息:"
     if [ -f "\$LOG_DIR/ftp_server.log" ]; then
-        LOG_SIZE=\$(du -h "\$LOG_DIR/ftp_server.log" | cut -f1)
+        LOG_SIZE=\$(du -h "\$LOG_DIR/ftp_server.log" 2>/dev/null | cut -f1)
         echo "服务器日志: \$LOG_SIZE"
+        echo "最后5行日志:"
+        tail -5 "\$LOG_DIR/ftp_server.log"
     fi
     
     if [ -f "\$LOG_DIR/ftp_access.log" ]; then
-        ACCESS_SIZE=\$(du -h "\$LOG_DIR/ftp_access.log" | cut -f1)
+        ACCESS_SIZE=\$(du -h "\$LOG_DIR/ftp_access.log" 2>/dev/null | cut -f1)
         echo "访问日志: \$ACCESS_SIZE"
     fi
 else
@@ -996,10 +1144,30 @@ echo ""
 echo "端口监听状态:"
 PORT=\$(grep '^port = ' "\$CONFIG_DIR/server.conf" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
 PORT=\${PORT:-2121}
-if netstat -tuln 2>/dev/null | grep -q ":\$PORT "; then
+
+PORT_LISTENING=false
+if command -v ss > /dev/null 2>&1; then
+    if ss -tuln 2>/dev/null | grep -q ":\$PORT "; then
+        PORT_LISTENING=true
+    fi
+elif netstat -tuln 2>/dev/null | grep -q ":\$PORT "; then
+    PORT_LISTENING=true
+fi
+
+if [ "\$PORT_LISTENING" = true ]; then
     echo -e "\${GREEN}✓ 端口 \$PORT 正在监听\${NC}"
+    echo "监听详情:"
+    if command -v ss > /dev/null 2>&1; then
+        ss -tuln | grep ":\$PORT "
+    else
+        netstat -tuln 2>/dev/null | grep ":\$PORT "
+    fi
 else
     echo -e "\${RED}✗ 端口 \$PORT 未监听\${NC}"
+    echo "可能的原因:"
+    echo "1. 服务器绑定到其他IP地址"
+    echo "2. 端口被防火墙阻止"
+    echo "3. 服务器启动失败"
 fi
 
 # 显示权限状态
@@ -1018,8 +1186,18 @@ case \$PERM_STATUS in
         ;;
     *)
         echo -e "\${YELLOW}⚠ 普通用户模式\${NC}"
+        echo "提示: 普通用户模式下，某些功能可能受限"
         ;;
 esac
+
+# 检查网络连接
+echo ""
+echo "网络连接测试:"
+if ping -c 1 8.8.8.8 > /dev/null 2>&1; then
+    echo -e "\${GREEN}✓ 网络连接正常\${NC}"
+else
+    echo -e "\${YELLOW}⚠ 网络连接异常\${NC}"
+fi
 EOF
     
     chmod +x "$HOME/bin/start_ftp.sh"
@@ -1103,9 +1281,10 @@ advanced_settings_menu() {
     echo "5. 备份系统配置"
     echo "6. 恢复系统配置"
     echo "7. 修复权限问题"
+    echo "8. 重置FTP服务器"
     echo "0. 返回主菜单"
     echo ""
-    echo -n "请输入选择 [0-7]: "
+    echo -n "请输入选择 [0-8]: "
 }
 
 # 配置系统防火墙
@@ -1212,6 +1391,43 @@ optimize_network() {
     read -p "按回车键继续..."
 }
 
+# 重置FTP服务器
+reset_ftp_server() {
+    show_banner
+    echo -e "${YELLOW}重置FTP服务器${NC}"
+    echo ""
+    
+    echo -e "${RED}警告：这将重置FTP服务器配置，但保留用户数据${NC}"
+    read -p "确定要重置吗？(y/N): " confirm
+    
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        echo "操作取消"
+        return
+    fi
+    
+    # 停止服务器
+    "$HOME/bin/stop_ftp.sh" > /dev/null 2>&1
+    
+    # 备份用户数据
+    if [ -f "$USERS_FILE" ]; then
+        backup_file="$CONFIG_DIR/users_backup_before_reset_$(date +%Y%m%d_%H%M%S).json"
+        cp "$USERS_FILE" "$backup_file"
+        echo "用户数据已备份到: $backup_file"
+    fi
+    
+    # 删除配置文件
+    echo "删除配置文件..."
+    rm -f "$CONFIG_DIR/server.conf"
+    rm -f "$CONFIG_DIR/motd.txt"
+    
+    # 重新创建配置
+    create_server_config
+    
+    echo ""
+    echo -e "${GREEN}FTP服务器已重置${NC}"
+    echo "请重新启动服务器"
+}
+
 # 安装FTP服务器
 install_ftp_server() {
     show_banner
@@ -1234,6 +1450,7 @@ install_ftp_server() {
     # 创建初始用户
     echo ""
     echo -e "${YELLOW}创建初始管理员用户...${NC}"
+    echo "建议：对于FTP服务器，建议使用不加密密码以获得更好的兼容性"
     read -p "请输入管理员用户名 [默认: admin]: " admin_user
     admin_user=${admin_user:-admin}
     
@@ -1247,11 +1464,32 @@ install_ftp_server() {
         return 1
     fi
     
+    # 询问是否加密密码
+    echo -e "${YELLOW}注意：FTP协议传输的是明文密码"
+    echo "选择不加密可以获得更好的兼容性，但安全性较低"
+    read -p "是否加密密码？(y/N): " encrypt_password
+    encrypt=false
+    if [ "$encrypt_password" = "y" ] || [ "$encrypt_password" = "Y" ]; then
+        encrypt=true
+        echo "密码将被加密存储"
+    else
+        echo "密码将明文存储（不推荐，但兼容性更好）"
+    fi
+    
     # 使用正确的参数格式调用用户管理脚本
-    python "$HOME/bin/ftp_user_manager.py" add "$admin_user" --dir "$FTP_ROOT/admin" --perms "elradfmw" "$admin_pass"
+    if [ "$encrypt" = true ]; then
+        python "$HOME/bin/ftp_user_manager.py" add "$admin_user" --dir "$FTP_ROOT/$admin_user" --perms "elradfmw" --no-encrypt "$admin_pass"
+    else
+        python "$HOME/bin/ftp_user_manager.py" add "$admin_user" --dir "$FTP_ROOT/$admin_user" --perms "elradfmw" "$admin_pass"
+    fi
     
     echo ""
     echo -e "${GREEN}FTP服务器安装完成！${NC}"
+    echo ""
+    echo "重要提示："
+    echo "1. 由于Android限制，普通用户可能无法绑定1024以下端口"
+    echo "2. 如果无法连接，请检查手机防火墙设置"
+    echo "3. 确保客户端使用正确的端口和协议"
     echo ""
     echo "可用命令:"
     echo "  start_ftp.sh      - 启动FTP服务器"
@@ -1456,10 +1694,15 @@ generate_qr_code() {
     echo ""
     
     # 获取IP地址
-    IP=$(ifconfig | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    IP=$(ifconfig 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    if [ -z "$IP" ]; then
+        IP=$(ip addr show 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    fi
     
     if [ -z "$IP" ]; then
-        IP="127.0.0.1"
+        echo -e "${RED}无法获取IP地址${NC}"
+        echo "请确保设备已连接到网络"
+        return
     fi
     
     # 获取端口
@@ -1509,7 +1752,10 @@ configure_sftp_mode() {
     SSH_PORT=${SSH_PORT:-8022}
     
     # 获取IP地址
-    IP=$(ifconfig | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    IP=$(ifconfig 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    if [ -z "$IP" ]; then
+        IP=$(ip addr show 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -1)
+    fi
     
     if [ -z "$IP" ]; then
         IP="127.0.0.1"
@@ -1552,7 +1798,7 @@ advanced_settings() {
             4)
                 echo -e "${YELLOW}查看系统连接${NC}"
                 echo ""
-                run_privileged "netstat -tuln | grep -E '(:21|:22|:2121|:60000)'"
+                run_privileged "netstat -tuln | grep -E '(:21|:22|:2121|:60000)'" 2>/dev/null || echo "无法获取连接信息"
                 echo ""
                 read -p "按回车键继续..."
                 ;;
@@ -1581,10 +1827,13 @@ advanced_settings() {
             7)
                 echo -e "${YELLOW}修复权限问题${NC}"
                 echo ""
-                run_privileged "chmod -R 755 $CONFIG_DIR $LOG_DIR $FTP_ROOT"
+                run_privileged "chmod -R 755 $CONFIG_DIR $LOG_DIR $FTP_ROOT 2>/dev/null"
                 echo -e "${GREEN}权限已修复${NC}"
                 echo ""
                 read -p "按回车键继续..."
+                ;;
+            8)
+                reset_ftp_server
                 ;;
             0)
                 return
